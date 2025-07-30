@@ -25,10 +25,10 @@ final class MonitorService{
             forName: NSWorkspace.didTerminateApplicationNotification,
             object: nil,
             queue: .main) { notification in
-            if let appFechado = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-                action(appFechado)
+                if let appFechado = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                    action(appFechado)
+                }
             }
-        }
     }
 }
 
@@ -36,20 +36,41 @@ struct AppInfo: Identifiable, Hashable{
     let id: pid_t
     let name: String?
     let icon: NSImage?
-    var isActive: Bool
+    let bundleIdentifier: String?
+    var status: StatusApp
     
     init(from app: NSRunningApplication){
         self.id = app.processIdentifier
         self.icon = app.icon
         self.name = app.localizedName
-        self.isActive = app.isActive
+        self.bundleIdentifier = app.bundleIdentifier
+        self.status = app.isActive ? .active : .notActive
+    
     }
 }
 
 enum StatusApp{
+    case active ///Timer Ativo
+    case notActive  ///Timer Parado
+    case removedFromSystem
+    
+    var color: Color{
+        switch self {
+        case .active:
+            return .green
+        case .notActive:
+            return .yellow
+        case .removedFromSystem:
+            return .red
+        }
+    }
+}
+
+enum StatusView{
     case inactive ///App no estado inicial
     case active ///Timer Ativo
     case notActive  ///Timer Parado
+    case nothingApp
     
     var description: String{
         switch self {
@@ -59,27 +80,36 @@ enum StatusApp{
             return "Monitoramento Ativo"
         case .notActive:
             return "Monitoramento Pausado"
+        case .nothingApp:
+            return "Todos os app estão inativos/ou não estão no sistema"
         }
     }
 }
 
 final class MonitorViewModel: ObservableObject{
     private let monitorService: MonitorService
+    
     private var timerCancellable: AnyCancellable?
+    private var geralTimerCancellable: AnyCancellable?
     private var cancellable: AnyCancellable?
-        
+    
     @Published private(set) var timerDuration: Double = 0
+    @Published private(set) var geralTimerDuration: Double = 0
     @Published private(set) var apps: [AppInfo] = []
-    @Published private(set) var selectApps: [AppInfo] = []
-    @Published private(set) var status: StatusApp = .inactive
-
+    @Published private(set) var monitoringApps: [AppInfo] = []
+    @Published private(set) var status: StatusView = .inactive
+    
     init(monitorService: MonitorService = .shared){
         self.monitorService = monitorService
-        self.startMonitoring()
         
         monitorService.appTerminated { [weak self] notification in
             guard let self = self else { return }
-            self.selectApps.removeAll(where: {$0.id == notification.processIdentifier})
+            
+            for (index, app) in self.monitoringApps.enumerated() {
+                if app.bundleIdentifier == notification.bundleIdentifier {
+                    self.monitoringApps[index].status = .removedFromSystem
+                }
+            }
         }
     }
     
@@ -93,8 +123,20 @@ final class MonitorViewModel: ObservableObject{
             }
     }
     
+    func geralTime(){
+        self.geralTimerCancellable = Timer
+            .publish(every: 1, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                geralTimerDuration += 1
+            }
+    }
+    
+    
     func playTimer(){
         self.status = .active
+
         if timerCancellable == nil {
             self.timerCancellable = Timer
                 .publish(every: 1, on: .main, in: .common)
@@ -102,13 +144,12 @@ final class MonitorViewModel: ObservableObject{
                 .sink { [weak self] _ in
                     guard let self = self else { return }
                     self.timerDuration += 1
-    //                self.verifyStatusApp()
                 }
-        }else{
-            print("Timer ativo")
         }
-        
     }
+    
+    //MARK: - Bug
+    // 1 - Quando um usuario entrar em um app fora da lista de selecionados, por padrão o timer para, entretando ele não volta a contar quando o usuario volta para o app.
     
     func pauseTimer(){
         self.status = .notActive
@@ -117,10 +158,23 @@ final class MonitorViewModel: ObservableObject{
     }
     
     func resetTimer(){
+        self.status = .inactive
         self.timerCancellable?.cancel()
         self.timerCancellable = nil
         self.timerDuration = 0
-        self.selectApps.removeAll()
+        self.geralTimerDuration = 0
+        self.geralTimerCancellable?.cancel()
+        self.geralTimerCancellable = nil
+        self.monitoringApps.removeAll()
+    }
+    
+    func formatTimeWithFormatter(_ totalSeconds: Double) -> String {
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.minute, .second]
+        formatter.unitsStyle = .positional
+        formatter.zeroFormattingBehavior = .pad
+        
+        return formatter.string(from: totalSeconds) ?? "00:00"
     }
     
     public func getAllApps() {
@@ -130,34 +184,41 @@ final class MonitorViewModel: ObservableObject{
     
     public func verifyStatusApp(){
         let aplications = monitorService.getAplications()
+                
+//        if self.status != .active {
+//            print("Inativo")
+//            return
+//        }
         
         for app in aplications {
-            for (indexSelect, selectApp) in self.selectApps.enumerated() {
-                if selectApp.id == app.processIdentifier{
-                    if selectApp.isActive != app.isActive{
-                        self.selectApps[indexSelect].isActive = app.isActive
+            for (indexSelect, selectApp) in self.monitoringApps.enumerated() {
+                if selectApp.bundleIdentifier == app.bundleIdentifier{
+                    self.monitoringApps[indexSelect].status = app.isActive ? .active : .notActive
+                    
+                    if selectApp.bundleIdentifier == app.bundleIdentifier && selectApp.status == .removedFromSystem{ //Foi removido mais voltou
+                        self.monitoringApps[indexSelect].status = .active
                     }
                 }
             }
         }
         
-        if !selectApps.isEmpty{
+//        if self.status == .active { O que acontece quando nao tem validacao? ele starta antes do play
             verifyStatus()
-        }
+//        }
     }
     
     func verifyStatus(){
-        for app in selectApps {
+        for app in monitoringApps {
             print("------------------------------")
             print("\(app.name ?? "") - \(app.id)" )
-            print(app.isActive)
+            print(app.status)
         }
         
-        if self.selectApps.contains(where: {$0.isActive}){
+        if self.monitoringApps.contains(where: { $0.status == .active }){
             playTimer()
-        }else{
-            pauseTimer()
+            return
         }
+        pauseTimer()
     }
     
     func printValues(_ app: NSRunningApplication){
@@ -166,7 +227,7 @@ final class MonitorViewModel: ObservableObject{
     }
     
     public func selectApp(_ app: AppInfo){
-        self.selectApps.append(app)
+        self.monitoringApps.append(app)
     }
 }
 
@@ -178,9 +239,22 @@ struct ContentView: View {
         VStack(alignment: .center){
             Text(vm.status.description)
             
-            Text("\(vm.timerDuration)")
+            HStack{
+                VStack{
+                    Text("Geral Time")
+                    Text(vm.formatTimeWithFormatter(vm.geralTimerDuration))
+                }
+                
+                Divider()
+                    .frame(width: 20, height: 20)
+                
+                VStack{
+                    Text("Product Time")
+                    Text(vm.formatTimeWithFormatter(vm.timerDuration))
+                }
+            }
             
-            List(vm.selectApps, id: \.id) { app in
+            List(vm.monitoringApps, id: \.id) { app in
                 HStack{
                     Image(nsImage: app.icon ?? NSImage())
                     
@@ -189,15 +263,9 @@ struct ContentView: View {
                     
                     Spacer()
                     
-                    if app.isActive {
-                        Circle()
-                            .frame(width: 8, height: 8)
-                            .foregroundStyle(.green)
-                    }else{
-                        Circle()
-                            .frame(width: 8, height: 8)
-                            .foregroundStyle(.red)
-                    }
+                    Circle()
+                        .frame(width: 8, height: 8)
+                        .foregroundStyle(app.status.color)
                 }
             }
             
@@ -207,6 +275,8 @@ struct ContentView: View {
             
             HStack{
                 Button("Play"){
+                    vm.startMonitoring()
+                    vm.geralTime()
                     vm.playTimer()
                 }
                 
@@ -247,6 +317,7 @@ struct RunningAppsView: View {
                 }
             }
             
+            
             Button("Pronto!"){
                 dismiss()
             }
@@ -261,4 +332,4 @@ struct RunningAppsView: View {
 #Preview {
     ContentView()
 }
- 
+
